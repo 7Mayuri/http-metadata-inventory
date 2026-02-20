@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+  # ──────────────────────────────────────────
+  # MongoDB – persistent data store
+  # ──────────────────────────────────────────
+  mongo:
+    image: mongo:7
+    container_name: metadata-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ──────────────────────────────────────────
+  # FastAPI application
+  # ──────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: metadata-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGO_HOST=mongo
+      - MONGO_PORT=27017
+      - MONGO_DB=metadata_inventory
+      - REQUEST_TIMEOUT=10
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+volumes:
+  mongo_data:
