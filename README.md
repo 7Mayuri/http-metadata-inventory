@@ -51,6 +51,12 @@ Quick check to see if the service and MongoDB are up.
 
 ---
 
+## Security
+
+SSRF protection is built in — if a submitted URL resolves to a private or internal IP (`127.0.0.1`, `10.x.x.x`, `192.168.x.x`) or the AWS/GCP metadata endpoint (`169.254.169.254`), the request is rejected with a 403 before any HTTP call is made.
+
+---
+
 ## Run tests
 
 No Docker needed for this — tests use an in-memory MongoDB mock.
@@ -74,19 +80,4 @@ tests/
   test_api.py   # 10 tests covering all flows
 Dockerfile
 docker-compose.yml
-```
-
----
-
-## A note on security
-
-The service blocks SSRF attacks — if a submitted URL resolves to a private or internal IP (like `127.0.0.1`, `10.x.x.x`, or the AWS metadata endpoint `169.254.169.254`), the request is rejected with a 403 before any HTTP call is made.
-
----
-
-## Running Tests (locally)
-
-```bash
-pip install -r requirements.txt
-python -m pytest tests/ -v
 ```
