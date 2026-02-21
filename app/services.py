@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Dict, Optional
 
 import requests as http_requests  # aliased to avoid shadowing FastAPI's Request
@@ -82,7 +82,7 @@ def fetch_metadata(url: str) -> MetadataDocument:
         cookies=cookies,
         page_source=response.text,
         status_code=response.status_code,
-        collected_at=datetime.utcnow(),
+        collected_at=datetime.now(UTC),
     )
 
 

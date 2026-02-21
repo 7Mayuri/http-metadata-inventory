@@ -8,10 +8,10 @@ self-explanatory.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 
 # ──────────────────────────────────────────────
@@ -33,14 +33,12 @@ class URLRequest(BaseModel):
 
 class CookieItem(BaseModel):
     """Simplified representation of an HTTP cookie."""
+    model_config = ConfigDict(extra="allow")
+
     name: str
     value: str
     domain: Optional[str] = None
     path: Optional[str] = None
-
-    class Config:
-        # Allow arbitrary fields for forward-compatibility
-        extra = "allow"
 
 
 class MetadataDocument(BaseModel):
@@ -54,11 +52,12 @@ class MetadataDocument(BaseModel):
     cookies: List[CookieItem] = Field(default_factory=list, description="Cookies set by the server")
     page_source: str = Field("", description="Raw HTML page source")
     status_code: int = Field(0, description="HTTP status code of the response")
-    collected_at: datetime = Field(default_factory=datetime.utcnow, description="Timestamp of collection")
+    collected_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        description="Timestamp of collection",
+    )
 
-    class Config:
-        populate_by_name = True
-        json_encoders = {datetime: lambda v: v.isoformat()}
+    model_config = ConfigDict(populate_by_name=True)
 
 
 # ──────────────────────────────────────────────
@@ -67,15 +66,8 @@ class MetadataDocument(BaseModel):
 
 class MetadataResponse(BaseModel):
     """Successful response containing collected metadata."""
-    url: str
-    headers: Dict[str, str]
-    cookies: List[CookieItem]
-    page_source: str
-    status_code: int
-    collected_at: str  # ISO-8601 string for JSON friendliness
-
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "url": "https://example.com",
                 "headers": {"Content-Type": "text/html"},
@@ -85,6 +77,14 @@ class MetadataResponse(BaseModel):
                 "collected_at": "2026-02-20T12:00:00",
             }
         }
+    )
+
+    url: str
+    headers: Dict[str, str]
+    cookies: List[CookieItem]
+    page_source: str
+    status_code: int
+    collected_at: str  # ISO-8601 string for JSON friendliness
 
 
 class MessageResponse(BaseModel):
