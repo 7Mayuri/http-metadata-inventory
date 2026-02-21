@@ -1,104 +1,86 @@
-# HTTP Metadata Inventory Service
+# Metadata Inventory Service
 
-A production-ready FastAPI microservice that collects and stores HTTP metadata (headers, cookies, page source) for any given URL, backed by MongoDB.
-
----
-
-## Architecture
-
-```
-┌────────────┐       ┌────────────────┐       ┌──────────┐
-│   Client    │──────▶│  FastAPI (api)  │──────▶│  MongoDB  │
-│  (curl/UI)  │◀──────│   :8000        │◀──────│  (mongo)  │
-└────────────┘       └────────────────┘       └──────────┘
-```
-
-| Layer | File | Purpose |
-|-------|------|---------|
-| Routes | `app/main.py` | HTTP endpoints, lifespan, dependency injection |
-| Models | `app/models.py` | Pydantic request / response schemas |
-| Services | `app/services.py` | Business logic – fetch, store, background jobs |
-| Database | `app/database.py` | MongoDB connection manager, indexes |
-| Tests | `tests/test_api.py` | Pytest suite with mongomock |
+A small FastAPI service that collects and stores HTTP metadata (headers, cookies, page source) for any URL you give it. MongoDB is used for storage and everything runs via Docker Compose.
 
 ---
 
-## Prerequisites
+## How to run
 
-- **Docker** ≥ 20.10
-- **Docker Compose** ≥ 2.0
-
----
-
-## Quick Start
+You just need Docker installed.
 
 ```bash
-# Clone the repo and cd into it
-cd metadata-inventory
-
-# Start everything (builds the image on first run)
 docker-compose up --build
 ```
 
-The API will be available at **http://localhost:8000**.
+That starts two things — the API on port 8000 and MongoDB. On subsequent runs you can drop `--build`.
 
-Interactive docs: **http://localhost:8000/docs**
+API: http://localhost:8000  
+Swagger docs: http://localhost:8000/docs
 
 ---
 
-## API Reference
+## Endpoints
 
-### `POST /metadata`
+### POST /metadata
+Give it a URL, it crawls it and saves the metadata.
 
-Collect metadata for a URL and store it in MongoDB.
-
-**Request body:**
-```json
-{
-  "url": "https://example.com"
-}
+```bash
+curl -X POST http://localhost:8000/metadata \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com"}'
 ```
 
-**Response (200):**
-```json
-{
-  "url": "https://example.com",
-  "headers": { "Content-Type": "text/html", ... },
-  "cookies": [],
-  "page_source": "<html>...</html>",
-  "status_code": 200,
-  "collected_at": "2026-02-20T12:00:00"
-}
-```
+Returns the headers, cookies, page source and status code.
 
-### `GET /metadata?url=https://example.com`
+---
 
-Retrieve stored metadata. If the URL isn't in the database, background collection is triggered.
+### GET /metadata?url=https://example.com
+Returns stored metadata if it exists.
 
-**Response when found (200):**
-```json
-{
-  "url": "https://example.com",
-  "headers": { ... },
-  "cookies": [],
-  "page_source": "<html>...</html>",
-  "status_code": 200,
-  "collected_at": "2026-02-20T12:00:00"
-}
-```
-
-**Response when NOT found (200):**
+If the URL hasn't been crawled yet, it kicks off collection in the background and tells you to check back later:
 ```json
 {
   "message": "Record doesn't exist & request has been logged to collect the metadata, please check later"
 }
 ```
 
-### `GET /health`
+---
 
-```json
-{ "message": "ok – mongo=connected" }
+### GET /health
+Quick check to see if the service and MongoDB are up.
+
+---
+
+## Run tests
+
+No Docker needed for this — tests use an in-memory MongoDB mock.
+
+```bash
+pip install -r requirements.txt
+python -m pytest tests/ -v
 ```
+
+---
+
+## Project structure
+
+```
+app/
+  main.py       # routes
+  services.py   # crawling logic + SSRF protection
+  database.py   # MongoDB connection
+  models.py     # request/response schemas
+tests/
+  test_api.py   # 10 tests covering all flows
+Dockerfile
+docker-compose.yml
+```
+
+---
+
+## A note on security
+
+The service blocks SSRF attacks — if a submitted URL resolves to a private or internal IP (like `127.0.0.1`, `10.x.x.x`, or the AWS metadata endpoint `169.254.169.254`), the request is rejected with a 403 before any HTTP call is made.
 
 ---
 
@@ -106,57 +88,5 @@ Retrieve stored metadata. If the URL isn't in the database, background collectio
 
 ```bash
 pip install -r requirements.txt
-pytest tests/ -v
+python -m pytest tests/ -v
 ```
-
-Tests use **mongomock** so no running MongoDB instance is needed.
-
----
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MONGO_HOST` | `mongo` | MongoDB hostname (Docker service name) |
-| `MONGO_PORT` | `27017` | MongoDB port |
-| `MONGO_DB` | `metadata_inventory` | Database name |
-| `REQUEST_TIMEOUT` | `10` | HTTP request timeout in seconds |
-
----
-
-## Project Structure
-
-```
-metadata-inventory/
-├── app/
-│   ├── __init__.py       # Package marker
-│   ├── main.py           # FastAPI app, routes, lifespan hooks
-│   ├── database.py       # MongoDB connection & index management
-│   ├── models.py         # Pydantic schemas
-│   └── services.py       # Business logic (fetch, store, background)
-├── tests/
-│   ├── __init__.py
-│   └── test_api.py       # Pytest suite (7 tests)
-├── .dockerignore
-├── .env                  # Default env vars
-├── Dockerfile            # Python 3.12-slim image
-├── docker-compose.yml    # Orchestrates api + mongo
-├── requirements.txt      # Pinned dependencies
-└── README.md             # This file
-```
-
----
-
-## Design Decisions
-
-1. **pymongo (sync)** over motor (async) – as required by the spec; keeps the code straightforward.
-2. **Upsert on `url`** – prevents duplicate documents; re-POSTing refreshes the metadata.
-3. **Background thread for GET-miss** – the GET endpoint returns immediately; a daemon thread handles the HTTP fetch + DB write.
-4. **mongomock for tests** – tests run in-memory with zero external dependencies.
-5. **Dependency injection** – `get_db` / `get_collection` are injected via FastAPI's `Depends()`, making them easy to override in tests.
-
----
-
-## License
-
-MIT

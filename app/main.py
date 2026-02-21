@@ -138,6 +138,13 @@ def post_metadata(
 
     try:
         doc = collect_and_store(collection, url)
+    except ValueError as exc:
+        # SSRF protection or invalid URL
+        logger.warning("Blocked URL %s: %s", url, exc)
+        raise HTTPException(
+            status_code=403,
+            detail=f"URL blocked: {exc}",
+        )
     except RequestException as exc:
         logger.error("Failed to fetch %s: %s", url, exc)
         raise HTTPException(
@@ -223,6 +230,17 @@ def get_metadata(
         raise HTTPException(
             status_code=400,
             detail="URL must start with http:// or https://",
+        )
+
+    # ── SSRF check for GET endpoint as well ──
+    from app.services import validate_url_safety
+    try:
+        validate_url_safety(url)
+    except ValueError as exc:
+        logger.warning("Blocked URL on GET %s: %s", url, exc)
+        raise HTTPException(
+            status_code=403,
+            detail=f"URL blocked: {exc}",
         )
 
     # ── Lookup in Mongo ──

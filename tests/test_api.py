@@ -189,3 +189,49 @@ def test_post_metadata_duplicate_upserts(mock_get):
     db = _mock_client["metadata_inventory"]
     count = db["metadata"].count_documents({"url": TEST_URL})
     assert count == 1
+
+
+# ──────────────────────────────────────────────
+# 8) POST /metadata – SSRF: localhost
+# ──────────────────────────────────────────────
+
+@patch("app.services.socket.gethostbyname", return_value="127.0.0.1")
+def test_post_metadata_ssrf_localhost(mock_dns):
+    """
+    POST with a URL that resolves to 127.0.0.1 (loopback) should be
+    blocked with 403 — prevents SSRF attacks against internal services.
+    """
+    response = client.post("/metadata", json={"url": "http://localhost:6379"})
+    assert response.status_code == 403
+    assert "blocked" in response.json()["detail"].lower()
+
+
+# ──────────────────────────────────────────────
+# 9) POST /metadata – SSRF: AWS metadata endpoint
+# ──────────────────────────────────────────────
+
+@patch("app.services.socket.gethostbyname", return_value="169.254.169.254")
+def test_post_metadata_ssrf_aws_metadata(mock_dns):
+    """
+    POST with the AWS metadata IP (169.254.169.254) should be blocked.
+    This is the classic cloud SSRF attack vector.
+    """
+    response = client.post("/metadata", json={"url": "http://169.254.169.254/latest/meta-data/"})
+    assert response.status_code == 403
+    assert "blocked" in response.json()["detail"].lower()
+
+
+# ──────────────────────────────────────────────
+# 10) GET /metadata – SSRF: private network
+# ──────────────────────────────────────────────
+
+@patch("app.services.socket.gethostbyname", return_value="10.0.0.1")
+def test_get_metadata_ssrf_private_ip(mock_dns):
+    """
+    GET with a URL resolving to a private IP range (10.x.x.x) should
+    be blocked even on the GET endpoint — SSRF check runs before
+    background collection is triggered.
+    """
+    response = client.get("/metadata", params={"url": "http://internal-service.corp/admin"})
+    assert response.status_code == 403
+    assert "blocked" in response.json()["detail"].lower()
