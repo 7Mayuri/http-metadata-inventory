@@ -1,9 +1,8 @@
 """
-models.py – Pydantic schemas for request validation and response serialisation.
+models.py
 
-Keeps a strict boundary between what the API accepts / returns and what
-lives in MongoDB.  Every field is documented so Swagger/OpenAPI docs are
-self-explanatory.
+All the request/response shapes live here.
+Pydantic handles the validation so I don't have to.
 """
 
 from __future__ import annotations
@@ -14,25 +13,21 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 
-# ──────────────────────────────────────────────
-# REQUEST MODELS
-# ──────────────────────────────────────────────
+# --- Request ---
 
 class URLRequest(BaseModel):
-    """Body for POST /metadata – the only required field is a valid HTTP(S) URL."""
+    """What the user sends us — just a URL."""
     url: HttpUrl = Field(
         ...,
-        description="Fully-qualified URL to collect metadata from (must start with http:// or https://)",
+        description="URL to collect metadata from",
         examples=["https://example.com"],
     )
 
 
-# ──────────────────────────────────────────────
-# INTERNAL / DB MODELS
-# ──────────────────────────────────────────────
+# --- What we store in MongoDB ---
 
 class CookieItem(BaseModel):
-    """Simplified representation of an HTTP cookie."""
+    """One cookie from the response. Keeping it simple."""
     model_config = ConfigDict(extra="allow")
 
     name: str
@@ -42,10 +37,7 @@ class CookieItem(BaseModel):
 
 
 class MetadataDocument(BaseModel):
-    """
-    The document shape stored in MongoDB.
-    `id` is mapped from Mongo's `_id` for JSON responses.
-    """
+    """This is what one document looks like in our MongoDB collection."""
     id: Optional[str] = Field(None, alias="_id", description="MongoDB ObjectId as string")
     url: str = Field(..., description="Canonical URL that was crawled")
     headers: Dict[str, str] = Field(default_factory=dict, description="HTTP response headers")
@@ -60,12 +52,10 @@ class MetadataDocument(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
-# ──────────────────────────────────────────────
-# RESPONSE MODELS
-# ──────────────────────────────────────────────
+# --- API responses ---
 
 class MetadataResponse(BaseModel):
-    """Successful response containing collected metadata."""
+    """What we send back when metadata is found."""
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
@@ -88,10 +78,10 @@ class MetadataResponse(BaseModel):
 
 
 class MessageResponse(BaseModel):
-    """Generic message response (used for GET-miss and error cases)."""
+    """Simple text message — used for "check back later" responses."""
     message: str
 
 
 class ErrorResponse(BaseModel):
-    """Structured error payload."""
+    """When something goes wrong."""
     detail: str

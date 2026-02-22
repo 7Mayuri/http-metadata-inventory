@@ -1,16 +1,12 @@
 """
-services.py – Business logic layer.
+services.py
 
-Responsibilities
-────────────────
-• Fetch HTTP metadata (headers, cookies, page source) for a given URL using
-  the `requests` library.
-• Persist metadata to MongoDB via pymongo (upsert to avoid duplicates).
-• Retrieve stored metadata by URL.
-• Kick off background collection when a GET request finds no existing record.
+This is where the actual work happens.
 
-All logic is kept *out* of the route handlers so it can be unit-tested
-independently and re-used by both POST and GET flows.
+- Crawl a URL and pull out its headers, cookies, and HTML
+- Save that data to MongoDB (no duplicates)
+- Look up saved data by URL
+- If a URL isn't in the DB yet, kick off a background fetch so it's ready next time
 """
 
 from __future__ import annotations
@@ -24,20 +20,17 @@ from datetime import UTC, datetime
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
-import requests as http_requests  # aliased to avoid shadowing FastAPI's Request
+import requests as http_requests  # renamed so it doesn't clash with FastAPI's Request
 from pymongo.collection import Collection
 
 from app.models import CookieItem, MetadataDocument
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# CONFIGURATION
-# ──────────────────────────────────────────────
-
+# How long to wait before giving up on a slow site
 REQUEST_TIMEOUT: int = int(os.getenv("REQUEST_TIMEOUT", "10"))
 
-# A realistic User-Agent avoids being blocked by simple bot-detection.
+# Pretend to be a real browser so sites don't block us immediately
 DEFAULT_HEADERS: Dict[str, str] = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -49,41 +42,39 @@ DEFAULT_HEADERS: Dict[str, str] = {
 # ──────────────────────────────────────────────
 # SSRF PROTECTION
 # ──────────────────────────────────────────────
-# These IP ranges must NEVER be crawled. An attacker could submit
-# http://169.254.169.254/latest/meta-data/ to steal cloud credentials
-# (AWS/GCP metadata endpoint), or http://127.0.0.1:6379 to probe
-# internal services. Blocking private/reserved ranges prevents this.
 
+# These are IP ranges that only exist inside private networks or cloud infrastructure.
+# We never want our server making requests to these — an attacker could submit
+# something like http://169.254.169.254 (AWS metadata endpoint) and our server
+# would happily fetch it, leaking cloud credentials.
 BLOCKED_IP_RANGES = [
-    ipaddress.ip_network("10.0.0.0/8"),        # RFC1918 – private
-    ipaddress.ip_network("172.16.0.0/12"),      # RFC1918 – private
-    ipaddress.ip_network("192.168.0.0/16"),     # RFC1918 – private
-    ipaddress.ip_network("127.0.0.0/8"),        # loopback
-    ipaddress.ip_network("169.254.0.0/16"),     # link-local / AWS metadata
-    ipaddress.ip_network("0.0.0.0/8"),          # "this" network
-    ipaddress.ip_network("100.64.0.0/10"),      # carrier-grade NAT
-    ipaddress.ip_network("192.0.0.0/24"),       # IETF protocol assignments
-    ipaddress.ip_network("198.18.0.0/15"),      # benchmarking
-    ipaddress.ip_network("::1/128"),             # IPv6 loopback
-    ipaddress.ip_network("fc00::/7"),            # IPv6 unique local
+    ipaddress.ip_network("10.0.0.0/8"),        # private network
+    ipaddress.ip_network("172.16.0.0/12"),      # private network
+    ipaddress.ip_network("192.168.0.0/16"),     # private network (home/office routers)
+    ipaddress.ip_network("127.0.0.0/8"),        # localhost
+    ipaddress.ip_network("169.254.0.0/16"),     # AWS/GCP metadata endpoint lives here
+    ipaddress.ip_network("0.0.0.0/8"),          # invalid source address
+    ipaddress.ip_network("100.64.0.0/10"),      # carrier NAT, not public internet
+    ipaddress.ip_network("192.0.0.0/24"),       # reserved by IETF
+    ipaddress.ip_network("198.18.0.0/15"),      # used for benchmarking, not real sites
+    ipaddress.ip_network("::1/128"),             # IPv6 localhost
+    ipaddress.ip_network("fc00::/7"),            # IPv6 private network
     ipaddress.ip_network("fe80::/10"),           # IPv6 link-local
 ]
 
 
 def validate_url_safety(url: str) -> None:
     """
-    Block SSRF (Server-Side Request Forgery) attacks.
+    Before we crawl anything, make sure the URL isn't pointing at
+    something inside our own infrastructure.
 
-    Resolves the URL's hostname to an IP address and checks it against
-    known private/internal/cloud-metadata IP ranges. Raises ValueError
-    if the URL is unsafe.
+    We resolve the hostname to an IP first, then check if that IP
+    is in any of the blocked ranges. If it is, we raise an error
+    and never make the HTTP request.
 
-    Why this matters:
-        CloudSEK's product crawls arbitrary user-supplied URLs. Without
-        this check, an attacker could:
-        - Read AWS/GCP instance metadata (169.254.169.254)
-        - Port-scan internal services (127.0.0.1, 10.x.x.x)
-        - Access databases on the private network (192.168.x.x)
+    This stops SSRF attacks — where someone tricks our server into
+    fetching internal services like databases, admin panels, or
+    cloud metadata endpoints.
     """
     parsed = urlparse(url)
     hostname = parsed.hostname
@@ -91,10 +82,11 @@ def validate_url_safety(url: str) -> None:
     if not hostname:
         raise ValueError("Cannot extract hostname from URL")
 
-    # Block obviously dangerous schemes
+    # Only allow regular web URLs
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"Unsupported URL scheme: {parsed.scheme}")
 
+    # Resolve hostname → IP. If it can't be resolved, reject it.
     try:
         resolved_ip = socket.gethostbyname(hostname)
     except socket.gaierror:
@@ -102,6 +94,7 @@ def validate_url_safety(url: str) -> None:
 
     ip = ipaddress.ip_address(resolved_ip)
 
+    # Check the resolved IP against every blocked range
     for blocked in BLOCKED_IP_RANGES:
         if ip in blocked:
             raise ValueError(
@@ -113,30 +106,28 @@ def validate_url_safety(url: str) -> None:
 
 
 # ──────────────────────────────────────────────
-# CORE: FETCH METADATA
+# FETCH
 # ──────────────────────────────────────────────
 
 def fetch_metadata(url: str) -> MetadataDocument:
     """
-    Make an HTTP GET request to *url* and return a `MetadataDocument`
-    populated with headers, cookies, page source, and status code.
+    Crawl the given URL and return everything we collected —
+    headers, cookies, page source, and status code.
 
-    Raises
-    ------
-    requests.exceptions.RequestException
-        On any network / HTTP error (timeout, DNS failure, etc.).
+    Raises requests.exceptions.RequestException if the site is
+    unreachable, times out, or returns a network error.
     """
-    # ── SSRF guard: reject private/internal IPs before making the request ──
+    # Safety first — block internal/private URLs before making any request
     validate_url_safety(url)
 
     response = http_requests.get(
         url,
         headers=DEFAULT_HEADERS,
         timeout=REQUEST_TIMEOUT,
-        allow_redirects=True,
+        allow_redirects=True,  # follow redirects like a browser would
     )
 
-    # Convert cookie jar → list of CookieItem dicts
+    # Turn the cookie jar into a plain list of objects we can store
     cookies = [
         CookieItem(
             name=cookie.name,
@@ -158,29 +149,30 @@ def fetch_metadata(url: str) -> MetadataDocument:
 
 
 # ──────────────────────────────────────────────
-# DB: STORE & RETRIEVE
+# STORE & RETRIEVE
 # ──────────────────────────────────────────────
 
 def store_metadata(collection: Collection, doc: MetadataDocument) -> str:
     """
-    Upsert metadata into MongoDB.
+    Save metadata to MongoDB.
 
-    Uses `url` as the match key so that re-collecting the same URL
-    overwrites the old record rather than creating a duplicate.
+    We use an upsert — if a document with this URL already exists,
+    we update it. If not, we insert a new one. This way the same URL
+    can never create duplicate records.
 
-    Returns the string representation of the upserted document's `_id`.
+    Returns the MongoDB _id of the saved document.
     """
     payload = doc.model_dump(exclude={"id"})
-    # Convert CookieItem objects to dicts for Mongo storage
+    # CookieItem objects need to be dicts before going into Mongo
     payload["cookies"] = [c.model_dump() for c in doc.cookies]
 
     result = collection.update_one(
-        {"url": doc.url},       # filter
-        {"$set": payload},      # update
-        upsert=True,            # insert if not found
+        {"url": doc.url},   # find document by URL
+        {"$set": payload},  # overwrite all fields
+        upsert=True,        # create it if it doesn't exist yet
     )
 
-    # Return the _id (either the matched doc or the newly inserted one)
+    # Return the _id — either the new one or the existing one
     if result.upserted_id:
         return str(result.upserted_id)
 
@@ -190,28 +182,28 @@ def store_metadata(collection: Collection, doc: MetadataDocument) -> str:
 
 def find_metadata(collection: Collection, url: str) -> Optional[Dict[str, Any]]:
     """
-    Look up a stored metadata document by URL.
+    Look up a URL in the database.
 
-    Returns the raw Mongo document (dict) or None if not found.
+    Returns the document as a dict, or None if we haven't crawled it yet.
     """
     doc = collection.find_one({"url": url})
     if doc:
-        # Convert ObjectId → str so JSON serialisation works
-        doc["_id"] = str(doc["_id"])
+        doc["_id"] = str(doc["_id"])  # ObjectId isn't JSON serialisable, convert it
     return doc
 
 
 # ──────────────────────────────────────────────
-# BACKGROUND COLLECTION (used by GET-miss flow)
+# BACKGROUND COLLECTION
 # ──────────────────────────────────────────────
 
 def collect_metadata_in_background(collection: Collection, url: str) -> None:
     """
-    Spawn a daemon thread that fetches metadata for *url* and stores it.
+    When a GET request comes in for a URL we haven't seen before,
+    we don't want to make the user wait. So we return a response immediately
+    and do the actual crawling in a background thread.
 
-    This is the "internally trigger metadata collection" requirement:
-    the GET endpoint returns immediately with a message, and the actual
-    HTTP call + DB write happens asynchronously.
+    By the time they check again, the data should be there.
+    daemon=True means this thread won't block the server from shutting down.
     """
 
     def _worker() -> None:
@@ -219,7 +211,7 @@ def collect_metadata_in_background(collection: Collection, url: str) -> None:
             logger.info("Background collection started for %s", url)
             doc = fetch_metadata(url)
             store_metadata(collection, doc)
-            logger.info("Background collection completed for %s", url)
+            logger.info("Background collection done for %s", url)
         except Exception:
             logger.exception("Background collection failed for %s", url)
 
@@ -228,14 +220,13 @@ def collect_metadata_in_background(collection: Collection, url: str) -> None:
 
 
 # ──────────────────────────────────────────────
-# ORCHESTRATION HELPERS
+# ORCHESTRATION
 # ──────────────────────────────────────────────
 
 def collect_and_store(collection: Collection, url: str) -> MetadataDocument:
     """
-    Synchronous end-to-end: fetch + store.  Used by the POST endpoint.
-
-    Returns the populated MetadataDocument so the caller can build a response.
+    Fetch a URL and save the result in one go.
+    This is what the POST endpoint calls — it needs the data back immediately.
     """
     doc = fetch_metadata(url)
     store_metadata(collection, doc)

@@ -1,14 +1,10 @@
 """
-main.py – FastAPI application entry-point.
+main.py
 
-Responsibilities
-────────────────
-• Define the FastAPI app with lifespan (startup / shutdown hooks).
-• Wire up two endpoints:
-      POST /metadata   – collect & store metadata for a URL
-      GET  /metadata   – retrieve stored metadata (or trigger background collection)
-• Provide a lightweight /health endpoint for Docker health-checks.
-• Use dependency injection (`Depends`) to pass the DB handle to routes.
+This is the entry point. All the routes are defined here.
+POST /metadata  — crawl a URL and save the result
+GET  /metadata  — look up saved data (or start background fetch)
+GET  /health    — simple health check for Docker
 """
 
 from __future__ import annotations
@@ -34,10 +30,7 @@ from app.services import (
     find_metadata,
 )
 
-# ──────────────────────────────────────────────
-# LOGGING
-# ──────────────────────────────────────────────
-
+# Basic logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -45,34 +38,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────────
-# LIFESPAN (replaces deprecated on_event)
-# ──────────────────────────────────────────────
-
+# Runs on startup and shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Startup: verify Mongo is reachable + create indexes.
-    Shutdown: close the Mongo client gracefully.
-    """
-    logger.info("Starting up – checking MongoDB connectivity …")
+    """Check Mongo on startup, close connection on shutdown."""
+    logger.info("Starting up — checking if MongoDB is alive...")
     if ping():
-        logger.info("MongoDB is reachable ✓")
-        # Ensure indexes exist before we serve traffic
-        get_collection()
+        logger.info("MongoDB is good")
+        get_collection()  # create indexes early
     else:
-        logger.warning("MongoDB is NOT reachable – the app will retry on first request")
+        logger.warning("MongoDB not reachable right now, will retry on first request")
 
-    yield  # ← application runs here
+    yield  # app runs here
 
-    logger.info("Shutting down – closing MongoDB connection …")
+    logger.info("Shutting down...")
     close_connection()
 
 
-# ──────────────────────────────────────────────
-# APP INSTANCE
-# ──────────────────────────────────────────────
-
+# The actual app
 app = FastAPI(
     title="HTTP Metadata Inventory Service",
     description=(
@@ -84,18 +67,12 @@ app = FastAPI(
 )
 
 
-# ──────────────────────────────────────────────
-# DEPENDENCY SHORTCUT
-# ──────────────────────────────────────────────
-
+# Dependency injection — gives route handlers the mongo collection directly
 def _collection(db: Database = Depends(get_db)):
-    """Inject the `metadata` collection directly into handlers."""
     return get_collection(db)
 
 
-# ──────────────────────────────────────────────
-# HEALTH-CHECK
-# ──────────────────────────────────────────────
+# --- Health check ---
 
 @app.get(
     "/health",
@@ -104,16 +81,14 @@ def _collection(db: Database = Depends(get_db)):
     response_model=MessageResponse,
 )
 def health_check():
-    """Returns 200 if the API is up; includes Mongo connectivity status."""
+    """Quick check — is the API up and can it talk to Mongo?"""
     mongo_ok = ping()
     return MessageResponse(
         message=f"ok – mongo={'connected' if mongo_ok else 'unreachable'}"
     )
 
 
-# ──────────────────────────────────────────────
-# POST /metadata
-# ──────────────────────────────────────────────
+# --- POST /metadata ---
 
 @app.post(
     "/metadata",
@@ -129,17 +104,14 @@ def post_metadata(
     body: URLRequest,
     collection=Depends(_collection),
 ):
-    """
-    Accept a URL, crawl it synchronously, store the metadata in MongoDB,
-    and return the collected data.
-    """
+    """Crawl the URL right now, save it, return the data."""
     url = str(body.url)
-    logger.info("POST /metadata – url=%s", url)
+    logger.info("POST /metadata — url=%s", url)
 
     try:
         doc = collect_and_store(collection, url)
     except ValueError as exc:
-        # SSRF protection or invalid URL
+        # SSRF — someone tried to hit an internal IP
         logger.warning("Blocked URL %s: %s", url, exc)
         raise HTTPException(
             status_code=403,
@@ -168,9 +140,7 @@ def post_metadata(
     )
 
 
-# ──────────────────────────────────────────────
-# GET /metadata
-# ──────────────────────────────────────────────
+# --- GET /metadata ---
 
 @app.get(
     "/metadata",
@@ -218,21 +188,17 @@ def get_metadata(
     ),
     collection=Depends(_collection),
 ):
-    """
-    1. If the URL already exists in MongoDB → return the stored metadata.
-    2. If it does NOT exist → trigger background collection (no POST call)
-       and return a "please check later" message.
-    """
-    logger.info("GET /metadata – url=%s", url)
+    """Return saved data if we have it, otherwise kick off a background fetch."""
+    logger.info("GET /metadata — url=%s", url)
 
-    # ── Quick URL sanity check ──
+    # basic check — needs to be a proper URL
     if not url.startswith(("http://", "https://")):
         raise HTTPException(
             status_code=400,
             detail="URL must start with http:// or https://",
         )
 
-    # ── SSRF check for GET endpoint as well ──
+    # run SSRF check on GET too, not just POST
     from app.services import validate_url_safety
     try:
         validate_url_safety(url)
@@ -243,7 +209,7 @@ def get_metadata(
             detail=f"URL blocked: {exc}",
         )
 
-    # ── Lookup in Mongo ──
+    # check if we already have it
     existing = find_metadata(collection, url)
 
     if existing:
@@ -260,7 +226,7 @@ def get_metadata(
             ),
         )
 
-    # ── Not found → schedule background collection ──
+    # don't have it yet — fetch in background so user doesn't wait
     collect_metadata_in_background(collection, url)
 
     return MessageResponse(

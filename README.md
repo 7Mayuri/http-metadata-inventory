@@ -1,4 +1,4 @@
-# HTTP Metadata Inventory Service
+# Metadata Inventory Service
 
 A small FastAPI service that collects and stores HTTP metadata (headers, cookies, page source) for any URL you give it. MongoDB is used for storage and everything runs via Docker Compose.
 
